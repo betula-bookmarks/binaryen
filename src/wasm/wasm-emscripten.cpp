@@ -40,7 +40,7 @@ cashew::IString EM_JS_PREFIX("__em_js__");
 static Name STACK_INIT("stack$init");
 static Name POST_INSTANTIATE("__post_instantiate");
 
-void addExportedFunction(Module& wasm, Function* function) {
+static void addExportedFunction(Module& wasm, Function* function) {
   wasm.addFunction(function);
   auto export_ = new Export;
   export_->name = export_->value = function->name;
@@ -49,7 +49,7 @@ void addExportedFunction(Module& wasm, Function* function) {
 }
 
 // TODO(sbc): There should probably be a better way to do this.
-bool isExported(Module& wasm, Name name) {
+static bool isExported(Module& wasm, Name name) {
   for (auto& ex : wasm.exports) {
     if (ex->value == name) {
       return true;
@@ -725,7 +725,7 @@ void EmscriptenGlueGenerator::fixInvokeFunctionNames() {
   }
 }
 
-void printSignatures(std::ostream& o, const std::set<Signature>& c) {
+static void printSignatures(std::ostream& o, const std::set<Signature>& c) {
   o << "[";
   bool first = true;
   for (auto& sig : c) {
@@ -737,6 +737,43 @@ void printSignatures(std::ostream& o, const std::set<Signature>& c) {
     o << '"' << getSig(sig.results, sig.params) << '"';
   }
   o << "]";
+}
+
+static bool mainReadsParams(Module& module) {
+  // In the new llvm name mangling scheme for `main` we get the
+  // 2 argument main mangled as `__main_argc_argv` and the no
+  // argument form generates and alias called `__main_void`
+  if (module.getExportOrNull("__main_void")) {
+    return false;
+  }
+
+  if (module.getExportOrNull("__main_argc_argv")) {
+    return true;
+  }
+
+  // Handle the old/legacy sceme where main always takes 2 args
+  // but interall the 0-arg version is called a __original_main
+  auto* exp = module.getExportOrNull("main");
+  if (!exp || exp->kind != ExternalKind::Function) {
+    return false;
+  }
+
+  // If we have a main at all then assume it takes params unless
+  // we can prove otherwise.
+  auto* main = module.getFunction(exp->value);
+  if (main->sig.params == Type::none) {
+    return false;
+  }
+
+  // Legacy support for only style or wrapping where a void
+  // be renamed to __original_main and directly called by main.
+  if (auto* call = main->body->dynCast<Call>()) {
+    if (call->operands.empty()) {
+      return false;
+    }
+  }
+
+  return true;
 }
 
 std::string EmscriptenGlueGenerator::generateEmscriptenMetadata(
@@ -753,43 +790,6 @@ std::string EmscriptenGlueGenerator::generateEmscriptenMetadata(
 
   std::stringstream meta;
   meta << "{\n";
-
-  bool mainReadsParams = false;
-  // In standalone mode we export _start rather than main and we don't
-  // report or attept to calculate `mainReadsParams`.
-  if (!standalone) {
-    // In the new llvm name mangling scheme for `main` we get the
-    // 2 argument main mangled as `__main_argc_argv` and the no
-    // argument form generates and alias called `__main_void`
-    if (wasm.getExportOrNull("__main_void")) {
-      mainReadsParams = false;
-    } else if (wasm.getExportOrNull("__main_argc_argv")) {
-      mainReadsParams = true;
-    } else {
-      // Handle the old/legacy sceme where main always takes 2 args
-      // but interall the 0-arg version is called a __original_main
-      auto* exp = wasm.getExportOrNull("main");
-      if (exp) {
-        // If we have a main at all then assume it takes params unless
-        // we can prove otherwise.
-        mainReadsParams = true;
-        if (exp->kind == ExternalKind::Function) {
-          auto* main = wasm.getFunction(exp->value);
-          if (main->sig.params == Type::none) {
-            mainReadsParams = false;
-          } else {
-            // Legacy support for only style or wrapping where a void
-            // be renamed to __original_main and directly called by main.
-            if (auto* call = main->body->dynCast<Call>()) {
-              if (call->operands.empty()) {
-                mainReadsParams = false;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
 
   // Sadly llvm marks the __main_void alias of main which causes it to
   // exported because with emscripten llvm we equate llvm's concept
@@ -914,7 +914,7 @@ std::string EmscriptenGlueGenerator::generateEmscriptenMetadata(
   // of the __wasi_args_get and __wasi_args_sizes_get syscalls allow us to
   // DCE to the argument handling JS code instead.
   if (!standalone) {
-    meta << "  \"mainReadsParams\": " << int(mainReadsParams) << ",\n";
+    meta << "  \"mainReadsParams\": " << int(mainReadsParams(wasm)) << ",\n";
   }
 
   meta << "  \"features\": [";
